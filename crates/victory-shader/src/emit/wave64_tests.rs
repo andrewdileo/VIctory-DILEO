@@ -14,6 +14,48 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+#[test]
+fn tiled_wave32_group_assigns_each_console_thread_once() {
+    let words = [
+        0xD765_0003, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x0001_007E,
+        0x3408_0285, // v_lshlrev_b32 v4, 5, v1
+        0x4A08_0104, // v_add_nc_u32 v4, v4, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, false, 64);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11, // Thread coordinates x and y in v0 and v1.
+        threads: [32, 2, 1],
+    });
+    let ir = ir::build(&native.code, native.wave64, native.vgprs).expect("shader IR");
+    let shader = lowered_on(&native, &ir, &HashSet::new(), 32).expect("wave32 translation");
+    if let Ok(mut validator) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        validator.validate(&mut shader.dxil.clone()).expect("valid DXIL");
+    }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("tiled group: no hardware device for dispatch");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("wave32 compute pipeline");
+    let user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let output = host.dispatch(
+        &root,
+        &pso,
+        &Dispatch {
+            roots: vec![(0, Root::Constants(user_data))],
+            views: &[View::RawUav(64)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        },
+    ).expect("dispatch tiled wave32 group");
+    assert_eq!(&output[0][..64], &[1; 64]);
+    eprintln!("tiled group: hardware dispatch wrote all 64 outputs");
+}
+
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.
