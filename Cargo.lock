@@ -630,7 +630,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "victory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "victory-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -659,11 +659,11 @@ dependencies = [
 
 [[package]]
 name = "victory-formats"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "victory-game"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "memchr",
  "zlib-rs",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "victory-gpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "victory-hle"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "opus-pure",
  "tempfile",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "victory-loader"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "victory-pe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "object",
  "thiserror",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "victory-pipeline"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "victory-shader"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror",
  "windows",
@@ -891,7 +891,7 @@ checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
