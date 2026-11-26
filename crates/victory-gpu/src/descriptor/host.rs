@@ -1655,13 +1655,24 @@ impl HostHeap {
             probe_view_limit();
         }
         let null = if sampler {
-            0
+            D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE - 1
         } else {
             victory_shader::emit::view_heap_limit()
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size) = if sampler {
+            // The shader clamps sampler indices to the last slot. Back
+            // the full range and keep that slot out of title writes.
+            let size = null + 1;
+            match make(size) {
+                Ok(heap) => (heap, count.min(null), size),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, size, "no host sampler heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -1766,6 +1777,11 @@ impl HostHeap {
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, size) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+            if sampler {
+                for index in 0..size {
+                    h.null_sampler(index);
+                }
+            }
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
@@ -1774,14 +1790,14 @@ impl HostHeap {
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
-        const BLOCK: u32 = 1 << 16;
+        let block_size = if self.sampler { total } else { 1 << 16 };
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: BLOCK,
+                    NumDescriptors: block_size,
                     ..Default::default()
                 })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -1803,13 +1819,13 @@ impl HostHeap {
                     null_view(start);
                 }
                 let mut filled = 1;
-                while filled < BLOCK {
-                    let n = filled.min(BLOCK - filled);
+                while filled < block_size {
+                    let n = filled.min(block_size - filled);
                     host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
                     filled += n;
                 }
                 while done < end {
-                    let n = BLOCK.min(end - done);
+                    let n = block_size.min(end - done);
                     host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                     done += n;
                 }
@@ -5150,6 +5166,19 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shader_visible_sampler_heaps_reserve_the_last_slot() {
+        if host().is_none() {
+            return;
+        }
+        for (requested, writable) in [(16, 16), (2048, 2047)] {
+            let heap = HostHeap::new(true, requested).expect("shader-visible sampler heap");
+            // SAFETY: a live heap.
+            assert_eq!(unsafe { heap.heap.GetDesc().NumDescriptors }, 2048);
+            assert_eq!(heap.count, writable);
+        }
+    }
+
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
     #[test]
@@ -5613,6 +5642,8 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // SAFETY: a live upload buffer.
         heap.constant_at(1, &buffer, unsafe { buffer.GetGPUVirtualAddress() }, 969_472);
         assert!(alive(), "a view of the list's own memory");
+        assert_eq!(constant_bytes(0), 0);
+        assert_eq!(constant_bytes(1), 256);
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
