@@ -20,6 +20,23 @@ const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
     0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
 }
 
+#[test]
+fn duplicate_branch_targets_keep_one_phi_predecessor() {
+    // One path goes straight to the join and the other reaches it through
+    // a conditional branch whose target is also its fallthrough.
+    let shader = build_valu_cs(&[
+        s_mov_b32(6, 0x80 + 7),
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 -> join
+        s_mov_b32(6, 0x80 + 11),
+        0xBF84_0000, // s_cbranch_scc0 -> join
+        vop1(0x001, 0, sgpr(6)),
+    ]);
+    run_cases(&shader, &[[0, 0, 0, 0], [1, 0, 0, 0]], |backend, i, _, got| {
+        assert_eq!(got, [11, 7][i], "{backend}: case {i}");
+    });
+}
+
 /// SOP2 `op sdst, src0, src1`.
 const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
     0x8000_0000

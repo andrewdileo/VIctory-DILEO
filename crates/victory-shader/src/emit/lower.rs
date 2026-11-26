@@ -7425,6 +7425,9 @@ impl<'a> Lower<'a> {
             }
             let tail = self.tail[q].ok_or(WHY)?;
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            if incoming.iter().any(|&(_, predecessor)| predecessor == at) {
+                continue;
+            }
             let index = match arg {
                 Source::Loaded { load, first } => {
                     let here = std::mem::replace(&mut self.cur, at);
@@ -7548,6 +7551,9 @@ impl<'a> Lower<'a> {
             }
             let tail = self.tail[q].ok_or(WHY)?;
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            if incoming.iter().any(|&(_, predecessor)| predecessor == at) {
+                continue;
+            }
             let idx = match arg {
                 Source::Constant(w) if w.len() >= 4 => {
                     let k: [u32; 4] = w[..4].try_into().unwrap();
@@ -7712,6 +7718,9 @@ impl<'a> Lower<'a> {
                     let tail =
                         self.tail[q].ok_or("a per-lane descriptor joined from a later block")?;
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    if incoming.iter().any(|&(_, predecessor)| predecessor == at) {
+                        continue;
+                    }
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
@@ -12603,16 +12612,19 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        let jump = |lower: &mut Self, target: usize| {
+            let block = lower.block[target].expect("reachable");
+            if lower.counters.contains_key(&target) && lower.rpo[target] <= lower.rpo[b] {
+                let ok = lower.count_iteration(target, pred::IULT);
+                Term::CondBr(ok, block, lower.abort_block())
+            } else {
+                lower.enter_loop(b, target, lower.cur);
+                Term::Br(block)
+            }
+        };
         let term = match self.x.st.exits[b] {
-            LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
-            }
-            LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
-                Term::Br(self.block[t].expect("reachable"))
-            }
+            LaneExit::Jump(t) => jump(self, t),
+            LaneExit::Branch { taken, not_taken, .. } if taken == not_taken => jump(self, taken),
             LaneExit::Branch {
                 when,
                 taken,
@@ -12781,6 +12793,9 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                if incoming.iter().any(|&(_, predecessor)| predecessor == qb) {
+                    continue;
+                }
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
@@ -12830,6 +12845,9 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                if incoming.iter().any(|&(_, predecessor)| predecessor == qb) {
+                    continue;
+                }
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
