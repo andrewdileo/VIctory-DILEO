@@ -68,7 +68,6 @@ fn build() -> [u8; 32] {
             "VICTORY_NAN_SCRUB",
             // LOCAL (upstream): constant buffer slots marked.
             "VICTORY_CONSTANT_MARKS",
-            "VICTORY_DYNAMIC_VIEW_ADDRESSES",
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",

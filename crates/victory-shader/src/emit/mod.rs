@@ -123,23 +123,8 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDE_CONSTANT, SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    SLOT_STRIDES_BYTES, VIEW_ADDRESSES, constant_marks, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    constant_marks, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
-
-/// Enables the host table used when a shader reads a dynamically selected view's title address.
-pub fn dynamic_view_addresses() -> bool {
-    #[cfg(test)]
-    if TEST_DYNAMIC_VIEW_ADDRESSES.get() {
-        return true;
-    }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_VIEW_ADDRESSES").is_some_and(|v| v == "1"))
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_DYNAMIC_VIEW_ADDRESSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
