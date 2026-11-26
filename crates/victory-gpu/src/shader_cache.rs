@@ -69,10 +69,10 @@ fn build() -> [u8; 32] {
             // LOCAL (upstream): constant buffer slots marked.
             "VICTORY_CONSTANT_MARKS",
             "VICTORY_WAVE_WIDE",
+            "VICTORY_PRISON_REFLECTION_EXPERIMENT",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
-            "VICTORY_THREAD_TICKET",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
@@ -123,10 +123,10 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     // upstream isolated the stale reflection tiles to this dispatch.
     // Try the fallback only for the identified container in an explicit run.
-    let reflection = crate::switch::on("VICTORY_PRISON_REFLECTION_EXPERIMENT")
-        && blake3::hash(container).to_hex().starts_with("2cc4c197ee29e291");
     let translate = |c: &[u8]| {
-        let shader = if reflection {
+        let shader = if crate::switch::on("VICTORY_PRISON_REFLECTION_EXPERIMENT")
+            && blake3::hash(c).to_hex().starts_with("2cc4c197ee29e291")
+        {
             victory_shader::emit::translate_with_wave_wide(c)
         } else {
             victory_shader::emit::translate(c)
@@ -134,15 +134,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         shader.map_err(|e| e.to_string())
     };
     match CACHE.get() {
-        Some(cache) => {
-            let normal = build();
-            let key = if reflection {
-                blake3::keyed_hash(&normal, b"prison reflection wave-wide").into()
-            } else {
-                normal
-            };
-            cached(cache, &key, container, translate)
-        }
+        Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
 }

@@ -379,10 +379,7 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
-    /// Counter for console lanes on hosts that tile a multi-wave thread group.
-    thread_ticket: Option<u32>,
     wave_base: Option<V>,
-    wave_rank: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1443,7 +1440,6 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
-        let mut thread_ticket = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1570,9 +1566,6 @@ impl<'a> Lower<'a> {
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
-            } else if console_lanes && group > wave && std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0") {
-                thread_ticket = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -1744,9 +1737,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
-            thread_ticket,
             wave_base: None,
-            wave_rank: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -4125,11 +4116,13 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Host waves can receive tiled thread indices. Assign each wave a range of
-    /// console IDs with an LDS counter. Partial waves take IDs past the full
-    /// blocks so their arrival cannot shift the alignment of a full wave.
+    /// A console wave64 program in host waves of 32: the first console thread of this host wave
+    /// (0, 32, 64, ...). A GPU need not give a host wave consecutive thread indices (NVIDIA's
+    /// 8 x 8 groups), so each wave takes the next 32 from an LDS counter instead: every thread
+    /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
+    /// found. Branch-free, in the entry block, which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves.or(self.thread_ticket)?;
+        let slot = self.halves?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
@@ -4139,44 +4132,27 @@ impl<'a> Lower<'a> {
         let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
         self.s.m.store(e, ptr, zero);
-        // All waves must finish clearing the counter before any allocates IDs.
-        let mode = self.s.m.i32(1 | 8);
-        self.s.op(e, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
-        let wave = self.s.wave_size.expect("thread counter requires a fixed wave size");
-        let group: u32 = self.s.threads.expect("compute thread counter").into_iter().product();
-        let one = self.s.m.i32(1);
-        let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
-        let count = self.s.op(e, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[one, sum, unsigned]);
-        let rank = self.s.op(e, "wavePrefixOp.i32", Attr::NoUnwind, i32t, 121, &[one, sum, unsigned]);
-        let width = self.s.m.i32(wave);
-        let full = self.s.m.cmp(e, pred::EQ, count, width);
-        let first = self.s.m.cmp(e, pred::EQ, rank, zero);
-        let sixteen = self.s.m.i32(16);
-        let partial_count = self.s.m.bin(e, Bin::Shl, count, sixteen);
-        let take = self.s.m.select(e, full, width, partial_count);
-        let add = self.s.m.select(e, first, take, zero);
+        self.group_sync(e);
+        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let first = self.s.m.cmp(e, pred::EQ, lane, zero);
+        let k32 = self.s.m.i32(32);
+        let add = self.s.m.select(e, first, k32, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
-        let found = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
-        let low_mask = self.s.m.i32(0xffff);
-        let full_base = self.s.m.bin(e, Bin::And, found, low_mask);
-        let partial_offset = self.s.m.bin(e, Bin::LShr, found, sixteen);
-        let full_threads = self.s.m.i32(group / wave * wave);
-        let partial_base = self.s.m.bin(e, Bin::Add, full_threads, partial_offset);
-        let base = self.s.m.select(e, full, full_base, partial_base);
+        let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
-        self.wave_rank = Some(rank);
         Some(base)
     }
 
-    /// The console thread index in the group, using the reserved range when present.
+    /// The console thread index of this thread in the group: `wave_base` plus the host lane
+    /// (host waves of 32), else the wave's first thread index rounded down plus the lane.
     fn console_thread(&mut self) -> V {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
-        if let Some(base) = self.wave_base() {
-            return self.s.m.bin(e, Bin::Add, base, self.wave_rank.expect("made with wave base"));
-        }
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        if let Some(base) = self.wave_base() {
+            return self.s.m.bin(e, Bin::Add, base, lane);
+        }
         let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
         let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
         let wave = self.s.wave_size.unwrap_or(32);
@@ -4592,8 +4568,11 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Component `c` of the thread ID in the group, relabelled when the
-    /// shader requires the console's wave layout.
+    /// Component `c` of the thread id in the group. With console lanes, the
+    /// thread is relabelled so that its host lane is its console lane: the
+    /// flat id is the wave's first lane's, rounded down to the wave size,
+    /// plus the lane index. (A bijection while each host wave holds a
+    /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
@@ -4601,7 +4580,7 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() || self.thread_ticket.is_some() {
+        if self.halves.is_some() {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -7425,9 +7404,6 @@ impl<'a> Lower<'a> {
             }
             let tail = self.tail[q].ok_or(WHY)?;
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
-            if incoming.iter().any(|&(_, predecessor)| predecessor == at) {
-                continue;
-            }
             let index = match arg {
                 Source::Loaded { load, first } => {
                     let here = std::mem::replace(&mut self.cur, at);
@@ -7551,9 +7527,6 @@ impl<'a> Lower<'a> {
             }
             let tail = self.tail[q].ok_or(WHY)?;
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
-            if incoming.iter().any(|&(_, predecessor)| predecessor == at) {
-                continue;
-            }
             let idx = match arg {
                 Source::Constant(w) if w.len() >= 4 => {
                     let k: [u32; 4] = w[..4].try_into().unwrap();
@@ -7718,9 +7691,6 @@ impl<'a> Lower<'a> {
                     let tail =
                         self.tail[q].ok_or("a per-lane descriptor joined from a later block")?;
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    if incoming.iter().any(|&(_, predecessor)| predecessor == at) {
-                        continue;
-                    }
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
@@ -12612,19 +12582,16 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
-        let jump = |lower: &mut Self, target: usize| {
-            let block = lower.block[target].expect("reachable");
-            if lower.counters.contains_key(&target) && lower.rpo[target] <= lower.rpo[b] {
-                let ok = lower.count_iteration(target, pred::IULT);
-                Term::CondBr(ok, block, lower.abort_block())
-            } else {
-                lower.enter_loop(b, target, lower.cur);
-                Term::Br(block)
-            }
-        };
         let term = match self.x.st.exits[b] {
-            LaneExit::Jump(t) => jump(self, t),
-            LaneExit::Branch { taken, not_taken, .. } if taken == not_taken => jump(self, taken),
+            LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
+                let ok = self.count_iteration(t, pred::IULT);
+                let abort = self.abort_block();
+                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+            }
+            LaneExit::Jump(t) => {
+                self.enter_loop(b, t, self.cur);
+                Term::Br(self.block[t].expect("reachable"))
+            }
             LaneExit::Branch {
                 when,
                 taken,
@@ -12793,9 +12760,6 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                if incoming.iter().any(|&(_, predecessor)| predecessor == qb) {
-                    continue;
-                }
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
@@ -12845,9 +12809,6 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                if incoming.iter().any(|&(_, predecessor)| predecessor == qb) {
-                    continue;
-                }
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);

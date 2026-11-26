@@ -312,14 +312,9 @@ struct Flip {
     index: u32,
     handle: u64,
     key: u64,
-    cause: FlipCause,
-}
-
-#[derive(Clone, Copy)]
-enum FlipCause {
-    Refresh,
-    Upload(u64),
-    EarlierSubmissions,
+    /// The frame it was asked in, of a slot that shows nothing of the
+    /// texture until then ([`HostHeap::texture_slot_show_after`]).
+    late: Option<u64>,
 }
 
 /// Whether a title slot shows a texture that is new to it only once the
@@ -359,8 +354,6 @@ static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, 
 
 /// Slots held back by [`show_new_later`] since the start.
 pub(crate) static NEW_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "diagnostics")]
-pub(crate) static NEW_LATER_SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The submissions begun when the host texture `view` shows was made, if
 /// one begun before that may still run ([`crate::pool::begun_before`]). The
@@ -1662,24 +1655,13 @@ impl HostHeap {
             probe_view_limit();
         }
         let null = if sampler {
-            D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE - 1
+            0
         } else {
             victory_shader::emit::view_heap_limit()
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
-        let (heap, count, size) = if sampler {
-            // The shader clamps sampler indices to the last slot. Back
-            // the full range and keep that slot out of title writes.
-            let size = null + 1;
-            match make(size) {
-                Ok(heap) => (heap, count.min(null), size),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, size, "no host sampler heap");
-                    return None;
-                }
-            }
-        } else if null == 0 {
+        let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -1784,11 +1766,6 @@ impl HostHeap {
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, size) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
-            if sampler {
-                for index in 0..size {
-                    h.null_sampler(index);
-                }
-            }
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
@@ -1797,14 +1774,14 @@ impl HostHeap {
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
-        let block_size = if self.sampler { total } else { 1 << 16 };
+        const BLOCK: u32 = 1 << 16;
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: block_size,
+                    NumDescriptors: BLOCK,
                     ..Default::default()
                 })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -1826,13 +1803,13 @@ impl HostHeap {
                     null_view(start);
                 }
                 let mut filled = 1;
-                while filled < block_size {
-                    let n = filled.min(block_size - filled);
+                while filled < BLOCK {
+                    let n = filled.min(BLOCK - filled);
                     host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
                     filled += n;
                 }
                 while done < end {
-                    let n = block_size.min(end - done);
+                    let n = BLOCK.min(end - done);
                     host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                     done += n;
                 }
@@ -2556,9 +2533,9 @@ impl HostHeap {
             return;
         }
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
-        let cause = FlipCause::Upload(crate::frame::current());
+        let late = Some(crate::frame::current());
         job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, cause };
+            let flip = Flip { after: 0, heap, index, handle, key, late };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -2585,8 +2562,7 @@ impl HostHeap {
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         list.defer_host(move || {
             let after = crate::host::submissions().0;
-            let cause = late.map_or(FlipCause::Refresh, FlipCause::Upload);
-            let flip = Flip { after, heap, index, handle, key, cause };
+            let flip = Flip { after, heap, index, handle, key, late };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -2611,9 +2587,7 @@ impl HostHeap {
             let mut pending = NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner());
             if !pending.is_empty() {
                 for f in &ready {
-                    if matches!(f.cause, FlipCause::EarlierSubmissions) {
-                        pending.remove(&(f.heap, f.index, f.key));
-                    }
+                    pending.remove(&(f.heap, f.index, f.key));
                 }
             }
         }
@@ -2629,44 +2603,37 @@ impl HostHeap {
             // Written again since, or made null: that write is in the queue.
             // (A slot shown late is null until now.)
             let view = view_at(f.key as u32, (f.key >> 32) as u32);
-            let upload = matches!(f.cause, FlipCause::Upload(_));
-            let held_back = !matches!(f.cause, FlipCause::Refresh);
-            let there = shown != 0 || held_back;
+            let there = shown != 0 || f.late.is_some();
             let (true, true, Some(view)) = (f.key != 0 && record_key(f.handle) == f.key, there, view) else {
                 FLIPPED[1].fetch_add(1, Relaxed);
-                LATE[4].fetch_add(u64::from(upload), Relaxed);
+                LATE[4].fetch_add(u64::from(f.late.is_some()), Relaxed);
                 continue;
             };
             // Its memory went meanwhile: the texture pass finds that.
-            if held_back
+            if f.late.is_some()
                 && let View::Placed(_, resource, desc) = &view
             {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(resource).unwrap_or(1);
                 if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
-                    LATE[4].fetch_add(u64::from(upload), Relaxed);
+                    LATE[4].fetch_add(1, Relaxed);
                     continue;
                 }
             }
-            self.quick_is(f.index, 0);
             if let Some(kept) = make(&view, self.at(f.index)) {
                 #[cfg(feature = "diagnostics")]
-                note_before(f.index, shown, match f.cause {
-                    FlipCause::Refresh => "mip flip",
-                    FlipCause::Upload(_) => "shown after its upload",
-                    FlipCause::EarlierSubmissions => "shown after prior submissions",
-                });
+                note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
                 self.put(f.index);
                 #[cfg(feature = "diagnostics")]
                 let was = shown;
+                self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
                 self.keep(f.index, kept);
-                self.quick_is(f.index, f.key);
                 #[cfg(feature = "diagnostics")]
-                if upload && was != 0 {
+                if f.late.is_some() && was != 0 {
                     same_bytes(was, f.key);
                 }
-                if let FlipCause::Upload(since) = f.cause {
+                if let Some(since) = f.late {
                     let frames = crate::frame::current().saturating_sub(since);
                     let n = LATE[0].fetch_add(1, Relaxed) + 1;
                     let all = LATE[1].fetch_add(frames, Relaxed) + frames;
@@ -2679,11 +2646,8 @@ impl HostHeap {
                             LATE[4].load(Relaxed)
                         );
                     }
-                } else if matches!(f.cause, FlipCause::Refresh) {
-                    flipped += 1;
                 } else {
-                    #[cfg(feature = "diagnostics")]
-                    NEW_LATER_SHOWN.fetch_add(1, Relaxed);
+                    flipped += 1;
                 }
             }
         }
@@ -3122,28 +3086,15 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        // A view's range has to lie inside the buffer: a description that runs
-        // past it is not a valid call, and what a refused creation leaves in
-        // the slot is undefined rather than "whatever was there" -- enough to
-        // keep such a description away from a slot shaders read by index.
-        // SAFETY: a live buffer.
-        let size = unsafe { buffer.GetDesc() }.Width;
-        let (range, cut) = raw_range(size, offset, len);
-        if let Some(cut) = cut {
-            raw_range_count("SRV", cut, offset, len, size);
-        }
-        let Some(range) = range else {
-            self.null_raw_at(index);
-            return;
-        };
+        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: range.first,
-                    NumElements: range.elements,
+                    FirstElement: offset / 4,
+                    NumElements: elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -3175,27 +3126,14 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        // As `raw_at`: the range inside the buffer, or nothing at all. What a
-        // refused description leaves in the slot is undefined: it may leave the
-        // slot unusable, and a dispatch reading it then returns wrong bytes or
-        // faults. Not observed on this machine; recorded as a possibility.
-        // SAFETY: a live buffer.
-        let size = unsafe { buffer.GetDesc() }.Width;
-        let (range, cut) = raw_range(size, offset, len);
-        if let Some(cut) = cut {
-            raw_range_count("UAV", cut, offset, len, size);
-        }
-        let Some(range) = range else {
-            self.null_raw_uav_at(index);
-            return;
-        };
+        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: range.first,
-                    NumElements: range.elements,
+                    FirstElement: offset / 4,
+                    NumElements: elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -3545,14 +3483,8 @@ impl HostHeap {
                     self.clear_twin(index);
                     self.keep(index, kept);
                 }
-                let flip = Flip {
-                    after,
-                    heap: std::ptr::from_ref(self) as usize,
-                    index,
-                    handle,
-                    key,
-                    cause: FlipCause::EarlierSubmissions,
-                };
+                let late = Some(crate::frame::current());
+                let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late };
                 FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
                 NEW_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(held);
@@ -5140,100 +5072,6 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
-/// Where a raw buffer view starts and how many dwords it covers, both inside
-/// `size` bytes of buffer: `None` when the request has nothing in the buffer.
-///
-/// `FirstElement` is 64-bit and `NumElements` 32-bit, so only the length is cut
-/// at `u32::MAX`; the start is used as asked and never moved. Moving it is what
-/// a clamp would do, and clamping the start of a request that lies entirely past
-/// the buffer turns it into a view of the buffer's tail: 100 bytes of buffer
-/// with an offset of 112 used to view bytes 96 to 99 as if they had been asked
-/// for. A start at or past the last dword is a view of nothing instead.
-///
-/// Callers pass `offset` on 16 bytes: `draw.rs` biases by `offset & 15` on the
-/// UAV path and makes a null view for a root SRV that is not on 16, so a raw
-/// view's start stays on that boundary. An offset off it is refused here too.
-#[derive(Clone, Copy)]
-struct RawRange {
-    first: u64,
-    elements: u32,
-}
-
-/// Why a request lost part of its range, for the counters below.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Cut {
-    /// The start is at or past the buffer's last dword: nothing to view.
-    Past,
-    /// The length was cut to what the buffer holds.
-    Length,
-    /// The title named less than a dword: one element, as before this guard.
-    Short,
-    /// The start is not on the 16 bytes a raw view needs.
-    Unaligned,
-}
-
-fn raw_range(size: u64, offset: u64, len: u64) -> (Option<RawRange>, Option<Cut>) {
-    let words = size / 4;
-    if !offset.is_multiple_of(16) {
-        return (None, Some(Cut::Unaligned));
-    }
-    let asked = offset / 4;
-    if asked >= words {
-        return (None, Some(Cut::Past));
-    }
-    let avail = words - asked;
-    // A length under a dword made one element before this guard. The floor is
-    // kept because nothing was gathered about why the title would ask for less
-    // than a dword; the buffer's end still caps it.
-    let want = (len / 4).max(1);
-    let elements = want.min(avail).min(u64::from(u32::MAX));
-    let cut = if elements < want {
-        Some(Cut::Length)
-    } else if len < 4 {
-        Some(Cut::Short)
-    } else {
-        None
-    };
-    (
-        Some(RawRange {
-            first: asked,
-            elements: elements as u32,
-        }),
-        cut,
-    )
-}
-
-/// Counts what [`raw_range`] refused or cut, by kind (SRV, UAV) and cause, so
-/// that a run can say whether the guard applied at all. One atomic per cell,
-/// said on the first and every 4096th: no lock, nothing per view beyond that.
-fn raw_range_count(kind: &'static str, cut: Cut, offset: u64, len: u64, size: u64) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SRV: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-    static UAV: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-    let cell = match (kind, cut) {
-        ("SRV", Cut::Past) => &SRV[0],
-        ("SRV", Cut::Length) => &SRV[1],
-        ("SRV", Cut::Short) => &SRV[2],
-        ("SRV", Cut::Unaligned) => &SRV[3],
-        (_, Cut::Past) => &UAV[0],
-        (_, Cut::Length) => &UAV[1],
-        (_, Cut::Short) => &UAV[2],
-        (_, Cut::Unaligned) => &UAV[3],
-    };
-    let n = cell.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % 4096 == 0 {
-        tracing::warn!(
-            kind,
-            cut = ?cut,
-            offset,
-            len,
-            size,
-            seen = n,
-            "a raw buffer view the title's range did not cover"
-        );
-    }
-}
-
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -5311,19 +5149,6 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shader_visible_sampler_heaps_reserve_the_last_slot() {
-        if host().is_none() {
-            return;
-        }
-        for (requested, writable) in [(16, 16), (2048, 2047)] {
-            let heap = HostHeap::new(true, requested).expect("shader-visible sampler heap");
-            // SAFETY: a live heap.
-            assert_eq!(unsafe { heap.heap.GetDesc().NumDescriptors }, 2048);
-            assert_eq!(heap.count, writable);
-        }
-    }
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
@@ -5788,8 +5613,6 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // SAFETY: a live upload buffer.
         heap.constant_at(1, &buffer, unsafe { buffer.GetGPUVirtualAddress() }, 969_472);
         assert!(alive(), "a view of the list's own memory");
-        assert_eq!(constant_bytes(0), 0);
-        assert_eq!(constant_bytes(1), 256);
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
@@ -6614,120 +6437,4 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
-}
-
-#[cfg(test)]
-mod raw_range_tests {
-    use super::*;
-
-    fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
-        let (range, cut) = raw_range(size, offset, len);
-        (range.map(|v| (v.first, v.elements)), cut)
-    }
-
-    fn range(size: u64, offset: u64, len: u64) -> Option<(u64, u32)> {
-        rr(size, offset, len).0
-    }
-
-    /// The table of the first review, plus the counterexample it found: 100
-    /// bytes of buffer, an offset of 112 — the clamp this replaced viewed bytes
-    /// 96 to 99, which the request had asked nothing about.
-    #[test]
-    fn the_range_stays_inside_the_buffer() {
-        assert_eq!(range(1024, 0, 256), Some((0, 64)));
-        assert_eq!(range(1024, 768, 512), Some((192, 64)));
-        assert_eq!(range(1024, 1024, 16), None, "a start at the end");
-        assert_eq!(range(1024, 1040, 16), None, "a start past the end");
-        assert_eq!(range(100, 112, 16), None, "no intersection: never the tail");
-        assert_eq!(range(100, 96, 16), Some((24, 1)), "the last dword");
-        assert_eq!(range(100, 96, 4), Some((24, 1)));
-        assert_eq!(range(0, 0, 16), None, "an empty buffer");
-        assert_eq!(range(3, 0, 16), None, "no whole dword");
-        assert_eq!(range(1024, 0, 0), Some((0, 1)), "the floor of one element stands");
-        assert_eq!(range(1024, 0, 1), Some((0, 1)), "as does a length under a dword");
-        assert_eq!(range(1024, 3, 16), None, "not on 16 bytes");
-        assert_eq!(range(1024, u64::MAX, 16), None, "no wrap, no clamp back");
-        assert_eq!(range(1024, 0, u64::MAX), Some((0, 256)), "the length is cut");
-    }
-
-    /// Why a request was refused or cut, which is what the counters report.
-    #[test]
-    fn the_cause_is_the_one_the_counters_would_report() {
-        assert_eq!(rr(100, 112, 16), (None, Some(Cut::Past)));
-        assert_eq!(rr(1024, 3, 16), (None, Some(Cut::Unaligned)));
-        assert_eq!(rr(1024, 0, 0), (Some((0, 1)), Some(Cut::Short)));
-        assert_eq!(rr(1024, 768, 512), (Some((192, 64)), Some(Cut::Length)));
-        // Nothing cut, nothing refused: no counter is touched at all.
-        assert_eq!(rr(1024, 0, 256), (Some((0, 64)), None));
-        assert_eq!(rr(1024, 0, 1020), (Some((0, 255)), None), "255 of 256 dwords");
-    }
-
-    /// `FirstElement` is 64-bit: a start past the 32-bit element index is kept
-    /// as it is, not narrowed to `u32::MAX`.
-    #[test]
-    fn a_start_past_32_bits_is_kept() {
-        let size = 1u64 << 40;
-        let offset = (u64::from(u32::MAX) + 10) * 16;
-        let range = range(size, offset, 64).expect("inside the buffer");
-        assert_eq!(range.0, offset / 4);
-        assert!(range.0 > u64::from(u32::MAX));
-        assert_eq!(range.1, 16);
-    }
-
-    /// `NumElements` is 32-bit: the length alone is cut at `u32::MAX`.
-    #[test]
-    fn the_length_is_cut_at_32_bits() {
-        let size = 1u64 << 40;
-        assert_eq!(range(size, 0, u64::MAX), Some((0, u32::MAX)));
-    }
-
-    /// An aligned start far past a buffer is still refused: alignment is not a
-    /// reason to accept a request, and the check is not reached by the
-    /// unaligned case first.
-    #[test]
-    fn an_aligned_start_past_the_buffer_is_refused() {
-        let size = 1u64 << 40;
-        assert_eq!(rr(size, 1u64 << 60, 64), (None, Some(Cut::Past)));
-        assert_eq!(rr(size, size, 64), (None, Some(Cut::Past)));
-        assert_eq!(rr(size, size - 16, 64), (Some((size / 4 - 4, 4)), Some(Cut::Length)));
-    }
-
-    /// Every accepted range holds the four things the patch promises, and no
-    /// request that the input rules allow is turned away for no reason.
-    #[test]
-    fn accepted_ranges_hold_their_invariant() {
-        let sizes = [0u64, 1, 3, 4, 100, 1024, 4096, 1 << 30];
-        let offsets = [0u64, 4, 16, 48, 96, 112, 1024, 1040, 4096, u64::MAX];
-        let lens = [0u64, 1, 3, 4, 16, 512, 1 << 20, u64::MAX];
-        for size in sizes {
-            for offset in offsets {
-                for len in lens {
-                    let (range, _) = raw_range(size, offset, len);
-                    let aligned = offset.is_multiple_of(16);
-                    let inside = offset / 4 < size / 4;
-                    match range {
-                        Some(range) => {
-                            assert!(range.elements > 0, "{size} {offset} {len}");
-                            assert_eq!(
-                                range.first,
-                                offset / 4,
-                                "{size} {offset} {len}: the start moved"
-                            );
-                            assert_eq!(range.first % 4, 0, "a raw view starts on 16 bytes");
-                            assert!(
-                                range.first + u64::from(range.elements) <= size / 4,
-                                "{size} {offset} {len}: {} + {} past the buffer",
-                                range.first,
-                                range.elements
-                            );
-                        }
-                        None => assert!(
-                            !(aligned && inside),
-                            "{size} {offset} {len}: refused though the rules allow it"
-                        ),
-                    }
-                }
-            }
-        }
-    }
 }

@@ -3,15 +3,6 @@
 All notable changes to VIctory-DILEO are listed here.
 Maintained by Andrew DiLeo ([@andrewdileo](https://github.com/andrewdileo)).
 
-## [0.1.1] - 2026-11-26
-
-- Restored the shader translator and cache identity used before the recent shader integrations. Kept the raw buffer view bounds fix and the Series S FSR scale guard.
-- Added checksum-verified, portable Windows packages with separate saves, caches, and logs. [Windows release guide](docs/releases.md)
-
-## [0.2.0-rc.1] - 2026-11-26
-
-- Published the shader experiment as a separate prerelease. This version creates the alpha transmission pipeline on an RTX 5090. It is retained for comparison because gameplay showed shader and NPC face-texture regressions.
-
 ## [0.1.0] - 2026-11-26
 
 First public release, built from the internal RTX 5090 aggregate build.

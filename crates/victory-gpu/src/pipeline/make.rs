@@ -384,26 +384,22 @@ struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
-    early: [VecDeque<Arc<Pending>>; 2],
+    early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
-    slow: [VecDeque<Arc<Pending>>; 2],
+    slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
-    requested: [VecDeque<Arc<Pending>>; 2],
-    compute_now: usize,
-    compute_limit: usize,
+    requested: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
-            early: [const { VecDeque::new() }; 2],
-            slow: [const { VecDeque::new() }; 2],
+            early: VecDeque::new(),
+            slow: VecDeque::new(),
             slow_now: 0,
-            requested: [const { VecDeque::new() }; 2],
-            compute_now: 0,
-            compute_limit: usize::MAX,
+            requested: VecDeque::new(),
         }
     }
 
@@ -419,32 +415,28 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        let class = usize::from(p.graphics.is_none() && !p.screen);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
-            self.requested[class].push_back(p.clone());
+            self.requested.push_back(p.clone());
         } else if slow {
-            self.slow[class].push_back(p.clone());
+            self.slow.push_back(p.clone());
         } else {
-            self.early[class].push_back(p.clone());
+            self.early.push_back(p.clone());
         }
         Some(prev == NOT_QUEUED)
     }
 
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
-        // A pipeline promoted from an early queue can only be claimed once.
-        let classes = 1 + usize::from(self.compute_now < self.compute_limit);
-        let unclaimed = |lists: &mut [VecDeque<Arc<Pending>>; 2], priority| {
-            lists.iter_mut().take(classes).find_map(|list| {
-                std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == priority)
-            })
+        // An early entry can have been promoted and claimed already.
+        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
+            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = unclaimed(&mut self.requested, REQUESTED).or_else(|| unclaimed(&mut self.early, EARLY));
+            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow, EARLY);
+                p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
                     p.was_slow.store(true, Ordering::Relaxed);
                     self.slow_now += 1;
@@ -452,9 +444,6 @@ impl Queue {
             }
         }
         let p = p?;
-        if p.graphics.is_none() && !p.screen {
-            self.compute_now += 1;
-        }
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -462,23 +451,6 @@ impl Queue {
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
-
-/// Return the queue slots even if a driver pipeline compilation unwinds.
-struct WorkerSlots {
-    compute: bool,
-    slow: bool,
-}
-
-impl Drop for WorkerSlots {
-    fn drop(&mut self) {
-        if self.compute || self.slow {
-            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-            queue.compute_now -= usize::from(self.compute);
-            queue.slow_now -= usize::from(self.slow);
-            AVAILABLE.notify_all();
-        }
-    }
-}
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -530,7 +502,7 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
-        let mut general_workers = 0_usize;
+        let mut running = false;
         let workers = worker_count(
             std::env::var("VICTORY_PIPELINE_WORKERS")
                 .ok()
@@ -556,12 +528,11 @@ fn workers() -> bool {
                     }
                     loop {
                         let p = next(screens_only);
-                        {
-                            let _slots = WorkerSlots {
-                                compute: p.graphics.is_none() && !p.screen,
-                                slow: p.was_slow.load(Ordering::Relaxed),
-                            };
-                            p.make();
+                        p.make();
+                        if p.was_slow.load(Ordering::Relaxed) {
+                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                            queue.slow_now -= 1;
+                            AVAILABLE.notify_all();
                         }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
@@ -572,14 +543,11 @@ fn workers() -> bool {
                 });
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
-            } else if !screens_only {
-                general_workers += 1;
+            } else {
+                running = true;
             }
         }
-        // Dedicated screen workers remain available for screen passes.
-        // Reserve one general worker for other graphics when at least two started.
-        QUEUE.lock().unwrap_or_else(|e| e.into_inner()).compute_limit = general_workers.saturating_sub(1).max(1);
-        general_workers != 0
+        running
     })
 }
 
@@ -612,27 +580,6 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
-    }
-
-    #[test]
-    fn requested_graphics_precedes_compute_and_keeps_a_worker_available() {
-        let compute = || Arc::new(Pending::new(Vec::new(), None));
-        let graphics = || {
-            let mut pipeline = Pending::new(Vec::new(), None);
-            pipeline.screen = true;
-            Arc::new(pipeline)
-        };
-        let (first, second, visible) = (compute(), compute(), graphics());
-        let mut queue = Queue::new();
-        queue.compute_limit = 1;
-        queue.push(&first, REQUESTED);
-        queue.push(&second, REQUESTED);
-        queue.push(&visible, EARLY);
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &first));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &visible));
-        assert!(queue.pop(false, 1).is_none());
-        queue.compute_now -= 1;
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &second));
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

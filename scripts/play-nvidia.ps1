@@ -85,9 +85,6 @@ foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 # LOCAL (aggregate-5090): a scale that is no number ('off') leaves the title's own; the loader patches none.
 $scale = 0.0
 if ([double]::TryParse($settings.VICTORY_RENDER_SCALE, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$scale)) {
-    if ($console -eq 'S' -and $settings.VICTORY_OWN_UPSCALER -eq '0' -and $scale -ge 0.2 -and $scale -le 1.0) {
-        throw 'The Series S FSR path requires the title''s render scale. Set VICTORY_RENDER_SCALE=off.'
-    }
     Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
 } else {
     Write-Host "Series $console, the title's own render scale"

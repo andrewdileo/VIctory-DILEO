@@ -53,21 +53,12 @@ param(
     # A save folder (like ...\data) copied into this run's own folder and used
     # from there: the run's saves never touch the shared one or the source.
     # Every file is checked by SHA-256 after the copy.
-    [string]$Checkpoint,
-    # Override where this installation keeps saves, caches, and run logs.
-    [string]$RunRoot
+    [string]$Checkpoint
 )
 $ErrorActionPreference = 'Stop'
 $game = Get-Item -LiteralPath $GameExe
 if (!(Test-Path -LiteralPath "$PSScriptRoot\..\target\diag\victory.exe")) { throw 'Build the diagnostics binary first.' }
-$installRoot = Split-Path -Parent $PSScriptRoot
-if ($RunRoot) {
-    $root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RunRoot)
-} elseif (Test-Path -LiteralPath (Join-Path $installRoot 'build-info.json') -PathType Leaf) {
-    $root = Join-Path $installRoot 'runtime'
-} else {
-    $root = Join-Path $env:LOCALAPPDATA 'VIctory-aggregate-5090'
-}
+$root = Join-Path $env:LOCALAPPDATA 'VIctory-aggregate-5090'
 $data = Join-Path $root 'data'
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 if (!(Test-Path -LiteralPath $data)) {

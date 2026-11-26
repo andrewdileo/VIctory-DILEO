@@ -46,15 +46,6 @@ impl StaticSampler {
         }
     }
 
-    /// Clamp the decoded 14-bit bias to the range D3D12 root signatures accept.
-    pub fn mip_lod_bias_for_host(&self) -> f32 {
-        if self.mip_lod_bias.is_nan() {
-            0.0
-        } else {
-            self.mip_lod_bias.clamp(-16.0, 15.99)
-        }
-    }
-
     /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
@@ -97,14 +88,6 @@ impl StaticSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn static_sampler_mip_lod_bias_fits_d3d12() {
-        for (bits, expected) in [(0x2800, -16.0), (0x0080, 0.5), (0x0ffd, 4093.0 / 256.0), (0x1800, 15.99)] {
-            let sampler = StaticSampler::from_words([0, 0, bits, 0]);
-            assert_eq!(sampler.mip_lod_bias_for_host(), expected);
-        }
-    }
 
     #[test]
     fn console_compiled_samplers_decode() {
