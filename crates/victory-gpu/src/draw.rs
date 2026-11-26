@@ -2133,6 +2133,9 @@ impl State {
     ) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
+            // Publication of a newly pooled texture must still finish when
+            // proactive texture scanning is disabled.
+            host.texture_slots_flip();
             return;
         }
         let memory = crate::host::host().and_then(|h| h.video_memory());

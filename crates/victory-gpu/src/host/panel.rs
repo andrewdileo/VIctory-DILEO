@@ -26,7 +26,7 @@ const EVERY: Duration = Duration::from_millis(500);
 const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
-const COLUMNS: u32 = 40;
+const COLUMNS: u32 = 46;
 const LINES: u32 = 5;
 const RIM: u32 = 3;
 
@@ -226,13 +226,13 @@ fn text(c: &[f64; COUNTERS], ms: f64, _worst: f64, _cost: f64, _cpus: f64, host:
     vec![
         match shown {
             Some(s) => format!(
-                "SHOWN FPS {:.1}  P95 {:.0}  WORST {:.0}  LATE {:.0}%",
+                "OBS FPS {:.1} P95 {:.0} MAX {:.0} LATE {:.0}%",
                 s.per_second,
                 s.p95_ms,
                 s.worst_ms,
                 s.late_share * 100.0
             ),
-            None => format!("SHOWN FPS N/A  PRESENTS {:.1}", 1e3 / ms),
+            None => format!("OBS FPS N/A  PRESENTS {:.1}", 1e3 / ms),
         },
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT {:.1} MS  WAIT GPU {:.1}", c[0] / 1e3, c[3] / 1e3),

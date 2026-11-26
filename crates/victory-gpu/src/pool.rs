@@ -538,7 +538,7 @@ fn made_now(texture: &ID3D12Resource) {
         }
         recent.push_back((raw, now));
     }
-    let begun = crate::host::submissions().0;
+    let begun = crate::host::submitted_or_queued();
     NEWEST_BEGUN.fetch_max(begun, Ordering::Relaxed);
     let mut unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
     let finished = crate::host::submissions().1;
@@ -614,7 +614,7 @@ pub(crate) unsafe fn texture(
     d.Alignment = if small_placement() { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
     // SAFETY: plain queries.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
-    if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
+    if d.Alignment != 0 && (info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment) {
         d.Alignment = 0;
         info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     }

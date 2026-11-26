@@ -312,9 +312,14 @@ struct Flip {
     index: u32,
     handle: u64,
     key: u64,
-    /// The frame it was asked in, of a slot that shows nothing of the
-    /// texture until then ([`HostHeap::texture_slot_show_after`]).
-    late: Option<u64>,
+    cause: FlipCause,
+}
+
+#[derive(Clone, Copy)]
+enum FlipCause {
+    Refresh,
+    Upload(u64),
+    EarlierSubmissions,
 }
 
 /// Whether a title slot shows a texture that is new to it only once the
@@ -354,6 +359,8 @@ static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, 
 
 /// Slots held back by [`show_new_later`] since the start.
 pub(crate) static NEW_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+pub(crate) static NEW_LATER_SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The submissions begun when the host texture `view` shows was made, if
 /// one begun before that may still run ([`crate::pool::begun_before`]). The
@@ -2549,9 +2556,9 @@ impl HostHeap {
             return;
         }
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
-        let late = Some(crate::frame::current());
+        let cause = FlipCause::Upload(crate::frame::current());
         job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, late };
+            let flip = Flip { after: 0, heap, index, handle, key, cause };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -2578,7 +2585,8 @@ impl HostHeap {
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         list.defer_host(move || {
             let after = crate::host::submissions().0;
-            let flip = Flip { after, heap, index, handle, key, late };
+            let cause = late.map_or(FlipCause::Refresh, FlipCause::Upload);
+            let flip = Flip { after, heap, index, handle, key, cause };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -2603,7 +2611,9 @@ impl HostHeap {
             let mut pending = NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner());
             if !pending.is_empty() {
                 for f in &ready {
-                    pending.remove(&(f.heap, f.index, f.key));
+                    if matches!(f.cause, FlipCause::EarlierSubmissions) {
+                        pending.remove(&(f.heap, f.index, f.key));
+                    }
                 }
             }
         }
@@ -2619,37 +2629,44 @@ impl HostHeap {
             // Written again since, or made null: that write is in the queue.
             // (A slot shown late is null until now.)
             let view = view_at(f.key as u32, (f.key >> 32) as u32);
-            let there = shown != 0 || f.late.is_some();
+            let upload = matches!(f.cause, FlipCause::Upload(_));
+            let held_back = !matches!(f.cause, FlipCause::Refresh);
+            let there = shown != 0 || held_back;
             let (true, true, Some(view)) = (f.key != 0 && record_key(f.handle) == f.key, there, view) else {
                 FLIPPED[1].fetch_add(1, Relaxed);
-                LATE[4].fetch_add(u64::from(f.late.is_some()), Relaxed);
+                LATE[4].fetch_add(u64::from(upload), Relaxed);
                 continue;
             };
             // Its memory went meanwhile: the texture pass finds that.
-            if f.late.is_some()
+            if held_back
                 && let View::Placed(_, resource, desc) = &view
             {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(resource).unwrap_or(1);
                 if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
-                    LATE[4].fetch_add(1, Relaxed);
+                    LATE[4].fetch_add(u64::from(upload), Relaxed);
                     continue;
                 }
             }
+            self.quick_is(f.index, 0);
             if let Some(kept) = make(&view, self.at(f.index)) {
                 #[cfg(feature = "diagnostics")]
-                note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
+                note_before(f.index, shown, match f.cause {
+                    FlipCause::Refresh => "mip flip",
+                    FlipCause::Upload(_) => "shown after its upload",
+                    FlipCause::EarlierSubmissions => "shown after prior submissions",
+                });
                 self.put(f.index);
                 #[cfg(feature = "diagnostics")]
                 let was = shown;
-                self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
                 self.keep(f.index, kept);
+                self.quick_is(f.index, f.key);
                 #[cfg(feature = "diagnostics")]
-                if f.late.is_some() && was != 0 {
+                if upload && was != 0 {
                     same_bytes(was, f.key);
                 }
-                if let Some(since) = f.late {
+                if let FlipCause::Upload(since) = f.cause {
                     let frames = crate::frame::current().saturating_sub(since);
                     let n = LATE[0].fetch_add(1, Relaxed) + 1;
                     let all = LATE[1].fetch_add(frames, Relaxed) + frames;
@@ -2662,8 +2679,11 @@ impl HostHeap {
                             LATE[4].load(Relaxed)
                         );
                     }
-                } else {
+                } else if matches!(f.cause, FlipCause::Refresh) {
                     flipped += 1;
+                } else {
+                    #[cfg(feature = "diagnostics")]
+                    NEW_LATER_SHOWN.fetch_add(1, Relaxed);
                 }
             }
         }
@@ -3499,8 +3519,14 @@ impl HostHeap {
                     self.clear_twin(index);
                     self.keep(index, kept);
                 }
-                let late = Some(crate::frame::current());
-                let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late };
+                let flip = Flip {
+                    after,
+                    heap: std::ptr::from_ref(self) as usize,
+                    index,
+                    handle,
+                    key,
+                    cause: FlipCause::EarlierSubmissions,
+                };
                 FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
                 NEW_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(held);

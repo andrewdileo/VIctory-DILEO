@@ -461,12 +461,16 @@ pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
+/// Include title submissions still waiting for the host to start them.
+pub(crate) fn submitted_or_queued() -> u64 {
+    let queued = crate::queue::queued();
+    STARTED.load(Ordering::Acquire).saturating_add(queued)
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
-    // (Those the title made and the host has not begun get the next numbers.)
-    let queued = crate::queue::queued();
-    let started = STARTED.load(Ordering::Acquire) + queued;
+    let started = submitted_or_queued();
     if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
@@ -478,8 +482,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
 
 /// [`retire`] for a resource.
 pub(crate) fn retire_resource(object: ID3D12Resource) {
-    let queued = crate::queue::queued();
-    let started = STARTED.load(Ordering::Acquire) + queued;
+    let started = submitted_or_queued();
     if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
@@ -8723,15 +8726,47 @@ struct Shown {
     last: Option<(u32, i64)>,
     /// Intervals between frames put on screen (ms).
     intervals: Vec<f32>,
-    /// Presents made, and frames DXGI says reached the screen.
+    /// Presents made, and distinct present IDs observed on screen.
     made: u32,
     displayed: u32,
+    /// IDs between observations that could have been displayed or dropped.
+    unobserved: u32,
     /// Presents that returned an error, or that the window was occluded.
     failed: u32,
     occluded: u32,
     /// Times the statistics could not be read (disjoint, or unsupported).
     unavailable: u32,
     first_error: Option<i32>,
+}
+
+impl Shown {
+    fn observe(&mut self, id: u32, qpc: i64, ticks_per_ms: f64) {
+        if id == 0 || self.last.is_some_and(|(previous, _)| id == previous) {
+            return;
+        }
+        self.displayed += 1;
+        if let Some((previous, before)) = self.last.replace((id, qpc))
+            && id > previous
+        {
+            let gap = id - previous - 1;
+            self.unobserved = self.unobserved.saturating_add(gap);
+            if gap == 0 && qpc > before {
+                self.intervals.push(((qpc - before) as f64 / ticks_per_ms) as f32);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn dxgi_present_id_gaps_are_not_counted_as_displayed_frames() {
+    let mut shown = Shown::default();
+    for (present_id, time) in [(1, 10), (2, 40), (2, 45), (5, 90), (6, 125)] {
+        shown.observe(present_id, time, 1.0);
+    }
+    assert_eq!(shown.displayed, 4);
+    assert_eq!(shown.unobserved, 2);
+    assert_eq!(shown.intervals, [30.0, 35.0]);
 }
 
 impl Meter {
@@ -8775,24 +8810,11 @@ impl Meter {
             s.unavailable += 1;
             return;
         }
-        match s.last {
-            Some((count, qpc)) if stats.PresentCount > count => {
-                let k = stats.PresentCount - count;
-                let each = (stats.SyncQPCTime - qpc) as f64 / per_ms / f64::from(k);
-                // (Several shown since the last look: their share each.)
-                for _ in 0..k.min(16) {
-                    s.intervals.push(each as f32);
-                }
-                s.displayed += k;
-                s.last = Some((stats.PresentCount, stats.SyncQPCTime));
-            }
-            Some(_) => {}
-            None => s.last = Some((stats.PresentCount, stats.SyncQPCTime)),
-        }
+        s.observe(stats.PresentCount, stats.SyncQPCTime, per_ms);
     }
 
     /// The displayed-frame half of the pacing line.
-    fn shown_line(&mut self) {
+    fn shown_line(&mut self, elapsed: std::time::Duration) {
         let s = &mut self.shown;
         let v = &mut s.intervals;
         let summary = if v.is_empty() {
@@ -8805,7 +8827,7 @@ impl Meter {
             v.sort_by(f32::total_cmp);
             let at = |q: f32| v[((v.len() - 1) as f32 * q).round() as usize];
             *LAST_SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(LastShown {
-                per_second: v.len() as f32 * 1000.0 / total.max(1.0),
+                per_second: s.displayed as f32 / elapsed.as_secs_f32(),
                 p95_ms: at(0.95),
                 worst_ms: v[v.len() - 1],
                 late_share: over_ms / total.max(1.0),
@@ -8820,13 +8842,14 @@ impl Meter {
             )
         };
         tracing::info!(
-            "frames shown: {} of {} presents reached the screen, {summary}; presents failed {} (first {:#x}), occluded {}, statistics unavailable {}",
+            "frames shown: {} of {} presents observed on screen, {summary}; presents failed {} (first {:#x}), occluded {}, statistics unavailable {}; skipped present IDs {}",
             s.displayed,
             s.made,
             s.failed,
             s.first_error.unwrap_or(0),
             s.occluded,
             s.unavailable,
+            s.unobserved,
         );
         let last = s.last;
         *s = Shown { last, ..Shown::default() };
@@ -8883,7 +8906,7 @@ impl Meter {
             return;
         }
         self.pacing_line();
-        self.shown_line();
+        self.shown_line(elapsed);
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
@@ -9016,9 +9039,10 @@ impl Meter {
                     );
                 }
                 tracing::info!(
-                    "slots of textures made while lists sent before them ran, shown once those had run (VICTORY_SHOW_NEW_LATER={}), since the start: {}",
+                    "new texture slots waiting for prior submissions (VICTORY_SHOW_NEW_LATER={}): {} queued, {} published",
                     u8::from(crate::descriptor::host::show_new_later()),
-                    crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
+                    crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed),
+                    crate::descriptor::host::NEW_LATER_SHOWN.load(Ordering::Relaxed)
                 );
                 if crate::resource::held_only() {
                     let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
