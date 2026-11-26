@@ -193,6 +193,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_hle::save_pipeline_cache();
     println!("title exited with {code}");
     Ok(())
 }
